@@ -29,6 +29,14 @@ class KernelState;
 namespace xe {
 namespace kernel {
 namespace xam {
+class UserTracker;
+}  // namespace xam
+}  // namespace kernel
+}  // namespace xe
+
+namespace xe {
+namespace kernel {
+namespace xam {
 
 constexpr uint32_t kDashboardID = 0xFFFE07D1;
 const static std::string kDashboardStringID =
@@ -75,7 +83,7 @@ class ProfileManager {
 
   // Loading Profile means load everything
   // Loading Account means load basic data
-  ProfileManager(KernelState* kernel_state);
+  ProfileManager(KernelState* kernel_state, UserTracker* user_tracker);
 
   ~ProfileManager();
 
@@ -114,7 +122,8 @@ class ProfileManager {
   bool IsAnyProfileSignedIn() const { return !logged_profiles_.empty(); }
 
   std::filesystem::path GetProfileContentPath(
-      const uint64_t xuid, const uint32_t title_id = -1) const;
+      const uint64_t xuid, const uint32_t title_id = -1,
+      const XContentType content_type = XContentType::kInvalid) const;
 
   static bool IsGamertagValid(const std::string gamertag);
 
@@ -142,6 +151,7 @@ class ProfileManager {
   std::map<uint8_t, std::unique_ptr<UserProfile>> logged_profiles_;
 
   KernelState* kernel_state_;
+  UserTracker* user_tracker_;
 };
 
 }  // namespace xam

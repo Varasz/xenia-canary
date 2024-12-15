@@ -7,14 +7,13 @@
  ******************************************************************************
  */
 
-#include <cstring>
-
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/user_profile.h"
+#include "xenia/kernel/xam/user_settings.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xthread.h"
@@ -208,21 +207,6 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index,
                                       be<uint32_t>* buffer_size_ptr,
                                       uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
-  if (!xuid_count) {
-    assert_null(xuids);
-  } else {
-    assert_true(xuid_count == 1);
-    assert_not_null(xuids);
-    // TODO(gibbed): allow proper lookup of arbitrary XUIDs
-    // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
-    // until it's implemented for release builds...
-    xuid_count = 1;
-    if (kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
-      const auto& user_profile =
-          kernel_state()->xam_state()->GetUserProfile(user_index);
-      assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
-    }
-  }
   assert_zero(unk);  // probably flags
 
   // must have at least 1 to 32 settings
@@ -303,18 +287,15 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index,
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
 
-  // TODO(gibbed): setting validity checking without needing a user profile
-  // object.
   bool any_missing = false;
   for (uint32_t i = 0; i < setting_count; ++i) {
     auto setting_id = static_cast<uint32_t>(setting_ids[i]);
-    auto setting = user_profile->GetSetting(setting_id);
-    if (!setting) {
-      any_missing = true;
+    if (!UserSetting::is_setting_valid(setting_id)) {
       XELOGE(
           "xeXamUserReadProfileSettingsEx requested unimplemented setting "
           "{:08X}",
           setting_id);
+      any_missing = true;
     }
   }
   if (any_missing) {
@@ -334,29 +315,24 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index,
   out_header->settings_ptr =
       kernel_state()->memory()->HostToGuestVirtual(out_setting);
 
-  DataByteStream out_stream(
-      kernel_state()->memory()->HostToGuestVirtual(buffer), buffer, buffer_size,
-      needed_header_size);
+  uint32_t additional_data_buffer_ptr =
+      out_header->settings_ptr +
+      (setting_count * sizeof(X_USER_PROFILE_SETTING));
+
   for (uint32_t n = 0; n < setting_count; ++n) {
     uint32_t setting_id = setting_ids[n];
-    auto setting = user_profile->GetSetting(setting_id);
 
-    std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
-    out_setting->from =
-        !setting ? 0 : static_cast<uint32_t>(setting->GetSettingSource());
+    auto setting = kernel_state()->xam_state()->user_tracker()->GetUserSetting(
+        user_profile->xuid(), setting_id, out_setting,
+        additional_data_buffer_ptr);
+
     if (xuids) {
       out_setting->xuid = user_profile->xuid();
     } else {
       out_setting->xuid = -1;
       out_setting->user_index = user_index;
     }
-    out_setting->setting_id = setting_id;
 
-    if (setting) {
-      out_setting->data.type = static_cast<X_USER_DATA_TYPE>(
-          setting->GetSettingHeader()->setting_type.value);
-      setting->GetSettingData()->Append(&out_setting->data, &out_stream);
-    }
     ++out_setting;
   }
 
@@ -412,53 +388,14 @@ dword_result_t XamUserWriteProfileSettings_entry(
   }
 
   for (uint32_t n = 0; n < setting_count; ++n) {
-    const X_USER_PROFILE_SETTING& setting = settings[n];
+    const UserSetting setting = UserSetting(&settings[n]);
 
-    auto setting_type = static_cast<X_USER_DATA_TYPE>(setting.data.type);
-    if (setting_type == X_USER_DATA_TYPE::UNSET) {
+    if (!setting.is_valid_type()) {
       continue;
     }
 
-    XELOGD(
-        "XamUserWriteProfileSettings: setting index [{}]:"
-        " from={} setting_id={:08X} data.type={}",
-        n, (uint32_t)setting.from, (uint32_t)setting.setting_id,
-        static_cast<uint32_t>(setting.data.type));
-
-    switch (setting_type) {
-      case X_USER_DATA_TYPE::CONTENT:
-      case X_USER_DATA_TYPE::BINARY: {
-        uint8_t* binary_ptr =
-            kernel_state()->memory()->TranslateVirtual(setting.data.binary.ptr);
-
-        size_t binary_size = setting.data.binary.size;
-        std::vector<uint8_t> bytes;
-        if (setting.data.binary.ptr) {
-          // Copy provided data
-          bytes.resize(binary_size);
-          std::memcpy(bytes.data(), binary_ptr, binary_size);
-        } else {
-          // Data pointer was NULL, so just fill with zeroes
-          bytes.resize(binary_size, 0);
-        }
-
-        auto user_setting =
-            std::make_unique<UserSetting>(setting.setting_id, bytes);
-
-        user_setting->SetNewSettingSource(X_USER_PROFILE_SETTING_SOURCE::TITLE);
-        user_profile->AddSetting(std::move(user_setting));
-      } break;
-      case X_USER_DATA_TYPE::WSTRING:
-      case X_USER_DATA_TYPE::DOUBLE:
-      case X_USER_DATA_TYPE::FLOAT:
-      case X_USER_DATA_TYPE::INT32:
-      case X_USER_DATA_TYPE::INT64:
-      case X_USER_DATA_TYPE::DATETIME:
-      default: {
-        XELOGE("XamUserWriteProfileSettings: Unimplemented data type {}",
-               static_cast<uint32_t>(setting_type));
-      } break;
-    };
+    kernel_state()->xam_state()->user_tracker()->UpsertSetting(
+        user_profile->xuid(), title_id, &setting);
   }
 
   if (overlapped) {
@@ -630,7 +567,6 @@ dword_result_t XamUserCreateAchievementEnumerator_entry(
     requester_xuid = xuid;
   }
 
-  const util::XdbfGameData db = kernel_state()->title_xdbf();
   uint32_t title_id_ =
       title_id ? static_cast<uint32_t>(title_id) : kernel_state()->title_id();
 
@@ -638,18 +574,12 @@ dword_result_t XamUserCreateAchievementEnumerator_entry(
       kernel_state()->achievement_manager()->GetTitleAchievements(
           requester_xuid, title_id_);
 
-  if (user_title_achievements) {
-    for (const auto& entry : *user_title_achievements) {
-      auto item = XAchievementEnumerator::AchievementDetails{
-          entry.achievement_id,
-          xe::load_and_swap<std::u16string>(entry.achievement_name.c_str()),
-          xe::load_and_swap<std::u16string>(entry.unlocked_description.c_str()),
-          xe::load_and_swap<std::u16string>(entry.locked_description.c_str()),
-          entry.image_id,
-          entry.gamerscore,
-          entry.unlock_time.high_part,
-          entry.unlock_time.low_part,
-          entry.flags};
+  if (!user_title_achievements.empty()) {
+    for (const auto& entry : user_title_achievements) {
+      auto item = AchievementDetails(
+          entry.achievement_id, entry.achievement_name.c_str(),
+          entry.unlocked_description.c_str(), entry.locked_description.c_str(),
+          entry.image_id, entry.gamerscore, entry.unlock_time, entry.flags);
 
       e->AppendItem(item);
     }
